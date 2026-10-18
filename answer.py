@@ -1,16 +1,48 @@
 import os
+import time
 from dotenv import load_dotenv
 from google import genai
 
 from reader import read_pdf
 from chunker import chunk_by_lines
-from retriever import build_index, search
+from embed_retriever import build_embedding_index, search_embeddings
 
-MODEL = "gemini-flash-latest"
+MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
 PDF_PATH = "sample.pdf"
-TOP_K = 13
-MIN_SCORE = 0.05
+TOP_K = 4
+MIN_SCORE = 0.40
 NOT_FOUND = "I could not find this in the notes."
+RETRY_WORDS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "overloaded")
+
+
+def with_retry(func, attempts=4):
+    """Call func(); on temporary errors wait and try again."""
+    delay = 2
+    for attempt in range(1, attempts + 1):
+        try:
+            return func()
+        except Exception as e:
+            temporary = any(word in str(e) for word in RETRY_WORDS)
+            if not temporary or attempt == attempts:
+                raise
+            print(f"  (busy, retrying in {delay}s... attempt {attempt}/{attempts})")
+            time.sleep(delay)
+            delay *= 2
+
+
+def generate_answer(client, prompt):
+    """Try each model in turn until one works."""
+    last_error = None
+    for model in MODELS:
+        try:
+            response = with_retry(
+                lambda: client.models.generate_content(model=model, contents=prompt)
+            )
+            return response.text
+        except Exception as e:
+            last_error = e
+            print(f"  (model {model} failed, trying next one)")
+    raise last_error
 
 
 def build_prompt(question, context_chunks):
@@ -26,14 +58,14 @@ def build_prompt(question, context_chunks):
     )
 
 
-def answer_question(question, chunks, vectorizer, matrix, client):
-    results = search(question, chunks, vectorizer, matrix, top_k=TOP_K)
+def answer_question(question, chunks, matrix, client):
+    results = with_retry(
+        lambda: search_embeddings(client, question, chunks, matrix, top_k=TOP_K)
+    )
     relevant = [chunk for chunk, score in results if score >= MIN_SCORE]
     if not relevant:
         return NOT_FOUND
-    prompt = build_prompt(question, relevant)
-    response = client.models.generate_content(model=MODEL, contents=prompt)
-    return response.text
+    return generate_answer(client, build_prompt(question, relevant))
 
 
 def main():
@@ -44,7 +76,7 @@ def main():
 
     client = genai.Client(api_key=api_key)
     chunks = chunk_by_lines(read_pdf(PDF_PATH))
-    vectorizer, matrix = build_index(chunks)
+    matrix = with_retry(lambda: build_embedding_index(client, chunks))
     print(f"Loaded {len(chunks)} chunks from {PDF_PATH}.")
 
     while True:
@@ -54,7 +86,7 @@ def main():
         if not question:
             continue
         try:
-            print("\n" + answer_question(question, chunks, vectorizer, matrix, client))
+            print("\n" + answer_question(question, chunks, matrix, client))
         except Exception as e:
             print("Something went wrong:", e)
 
